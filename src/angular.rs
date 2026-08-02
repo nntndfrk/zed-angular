@@ -1,99 +1,115 @@
 use serde::Deserialize;
-use std::path::PathBuf;
-use std::{env, fs, vec};
 use zed::lsp::{Completion, CompletionKind};
 use zed::settings::LspSettings;
 use zed::CodeLabelSpan;
 use zed_extension_api::{self as zed, serde_json, Result};
 
-const SERVER_PATH: &str = "node_modules/@angular/language-server/index.js";
-const TYPESCRIPT_TSDK_PATH: &str = "node_modules/typescript/lib";
-
-const ANGULAR_LANGUAGE_SERVER_PACKAGE_NAME: &str = "@angular/language-server";
-const TYPESCRIPT_PACKAGE_NAME: &str = "typescript";
+/// Default location of the language server package, relative to the worktree root.
+const DEFAULT_SERVER_DIR: &str = "node_modules/@angular/language-server";
 
 #[derive(Deserialize, Default)]
 struct UserSettings {
     /// Maximum heap size (in MB) for the language server process, passed to
-    /// node as `--max-old-space-size`. Useful in large monorepos where the
-    /// server exceeds node's default (~4 GB) heap limit and crashes.
+    /// node as `--max-old-space-size`.
     max_ts_server_memory: Option<u32>,
+    /// Override the location of the `@angular/language-server` package.
+    /// Worktree-relative, absolute, or `~`-prefixed. Defaults to
+    /// `node_modules/@angular/language-server`.
+    angular_language_server_path: Option<String>,
 }
 
-struct AngularExtension {
-    did_find_server: bool,
-}
+struct AngularExtension;
 
 impl AngularExtension {
-    #[allow(dead_code)]
-    pub const LANGUAGE_SERVER_ID: &'static str = "angular";
-
-    fn file_exists_at_path(&self, path: &str) -> bool {
-        fs::metadata(path).map_or(false, |stat| stat.is_file())
+    /// Trim whitespace, a trailing `/index.js`, and trailing slashes so the
+    /// value always denotes the package *directory*.
+    fn normalize(path: &str) -> String {
+        let p = path.trim().replace('\\', "/");
+        let p = p.strip_suffix("/index.js").unwrap_or(&p);
+        p.trim_end_matches('/').to_string()
     }
 
-    fn server_script_path(&mut self, language_server_id: &zed::LanguageServerId) -> Result<String> {
-        let server_exists = self.file_exists_at_path(SERVER_PATH);
+    fn expand_home(worktree: &zed::Worktree, path: &str) -> String {
+        let rest = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\"));
 
-        if self.did_find_server && server_exists {
-            zed::set_language_server_installation_status(
-                language_server_id,
-                &zed::LanguageServerInstallationStatus::CheckingForUpdate,
-            );
+        match rest {
+            Some(rest) => {
+                let env = worktree.shell_env();
+                let home = env
+                    .iter()
+                    .find(|(k, _)| k == "HOME" || k == "USERPROFILE")
+                    .map(|(_, v)| v.as_str());
+
+                match home {
+                    Some(home) => {
+                        let home = home.trim_end_matches(['/', '\\']);
+                        format!("{home}/{rest}")
+                    }
+                    None => path.to_string(),
+                }
+            }
+            None => path.to_string(),
+        }
+    }
+
+    /// Resolve the language server package directory to an absolute path.
+    ///
+    /// Deliberately does not verify existence: `Worktree::read_text_file` reads
+    /// from Zed's worktree snapshot, which excludes gitignored trees such as
+    /// `node_modules` and unexpanded symlinked directories, so any check here
+    /// yields false negatives. node resolves the path against the real
+    /// filesystem and reports `MODULE_NOT_FOUND` if it is wrong.
+    fn resolve_server_dir(worktree: &zed::Worktree, override_path: Option<&str>) -> String {
+        let root = worktree.root_path();
+        let root = root.trim_end_matches('/');
+
+        let requested = override_path
+            .map(|p| Self::expand_home(worktree, p))
+            .map(|p| Self::normalize(&p))
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| DEFAULT_SERVER_DIR.to_string());
+
+        let is_drive_abs = requested.len() > 2
+            && requested.as_bytes()[1] == b':'
+            && requested.as_bytes()[2] == b'/';
+        if requested.starts_with('/') || is_drive_abs {
+            requested
+        } else {
+            format!("{root}/{requested}")
+        }
+    }
+
+    /// Probe roots: the worktree root, its `node_modules`, and each ancestor of
+    /// the resolved package directory (covers layouts such as
+    /// `client/node_modules/...`).
+    fn probe_locations(root: &str, server_dir: &str) -> String {
+        let root = root.trim_end_matches('/');
+        let mut paths = vec![root.to_string(), format!("{root}/node_modules")];
+
+        let mut current = server_dir;
+        for _ in 0..3 {
+            match current.rsplit_once('/') {
+                Some((head, _)) if !head.is_empty() => {
+                    paths.push(head.to_string());
+                    current = head;
+                }
+                _ => break,
+            }
         }
 
-        zed::set_language_server_installation_status(
-            language_server_id,
-            &zed::LanguageServerInstallationStatus::Downloading,
-        );
-
-        if !self.file_exists_at_path(SERVER_PATH) {
-            return Err(format!(
-                "Expected Angular language server path '{}' was not found in the project. Please ensure '{}' is installed in your project's node_modules.",
-                SERVER_PATH, ANGULAR_LANGUAGE_SERVER_PACKAGE_NAME
-            )
-            .into());
+        let mut unique = Vec::with_capacity(paths.len());
+        for p in paths {
+            if !unique.contains(&p) {
+                unique.push(p);
+            }
         }
-
-        self.did_find_server = true;
-        Ok(SERVER_PATH.to_string())
-    }
-
-    fn get_current_dir() -> Result<PathBuf> {
-        env::current_dir().map_err(|e| format!("Failed to get current directory: {}", e))
-    }
-
-    fn get_ng_probe_locations(worktree: &zed::Worktree) -> Vec<String> {
-        let mut paths = vec![];
-
-        // 1. Probe the open project's root folder (where the user's local node_modules lives)
-        paths.push(worktree.root_path());
-
-        // 2. Probe the project's sub node_modules directory explicitly
-        let project_node_modules = PathBuf::from(worktree.root_path()).join("node_modules");
-        paths.push(project_node_modules.to_string_lossy().to_string());
-
-        // 3. Probe the Zed extension's own node_modules directory as a fallback
-        if let Ok(current_dir) = Self::get_current_dir() {
-            let ext_node_modules = current_dir.join("node_modules");
-            paths.push(ext_node_modules.to_string_lossy().to_string());
-            paths.push(current_dir.to_string_lossy().to_string());
-        }
-
-        paths
-    }
-
-    fn get_ts_probe_locations(worktree: &zed::Worktree) -> Vec<String> {
-        // Use the exact same resolution rules for TypeScript probing
-        Self::get_ng_probe_locations(worktree)
+        unique.join(",")
     }
 }
 
 impl zed::Extension for AngularExtension {
     fn new() -> Self {
-        Self {
-            did_find_server: false,
-        }
+        Self
     }
 
     fn language_server_command(
@@ -101,43 +117,41 @@ impl zed::Extension for AngularExtension {
         language_server_id: &zed::LanguageServerId,
         worktree: &zed::Worktree,
     ) -> Result<zed::Command> {
-        let user_settings: UserSettings =
-            LspSettings::for_worktree(&language_server_id.to_string(), worktree)?
-                .initialization_options
+        let settings: UserSettings =
+            LspSettings::for_worktree(language_server_id.as_ref(), worktree)
+                .ok()
+                .and_then(|s| s.initialization_options)
                 .map(serde_json::from_value)
                 .transpose()
-                .map_err(|e| format!("Failed to parse initialization_options: {}", e))?
+                .map_err(|e| format!("Failed to parse `lsp.angular.initialization_options`: {e}"))?
                 .unwrap_or_default();
 
-        let server_path = self.server_script_path(language_server_id)?;
-        let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::new());
-        let full_path_to_server = current_dir.join(&server_path);
+        let root = worktree.root_path();
+        let server_dir =
+            Self::resolve_server_dir(worktree, settings.angular_language_server_path.as_deref());
+        let probes = Self::probe_locations(&root, &server_dir);
 
-        let mut args = vec![];
+        let mut args = Vec::new();
 
-        if let Some(max_memory) = user_settings.max_ts_server_memory {
-            args.push(format!("--max-old-space-size={}", max_memory));
+        // Node flags must come before the script path.
+        if let Some(mb) = settings.max_ts_server_memory {
+            args.push(format!("--max-old-space-size={mb}"));
         }
 
-        args.push(full_path_to_server.to_string_lossy().to_string());
-        args.push("--stdio".to_string());
-
-        // Probe paths: This tells the language-server where to seek and resolve "typescript/lib/tsserverlibrary"
-        args.push("--tsProbeLocations".to_string());
-        args.push(Self::get_ts_probe_locations(worktree).join(","));
-
-        args.push("--ngProbeLocations".to_string());
-        args.push(Self::get_ng_probe_locations(worktree).join(","));
-
-        // Provide the SDK path inside the project's folder hierarchy
-        let absolute_tsdk_path = current_dir.join(TYPESCRIPT_TSDK_PATH);
-        args.push("--tsdk".to_string());
-        args.push(absolute_tsdk_path.to_string_lossy().to_string());
+        args.push(format!("{server_dir}/index.js"));
+        args.push("--stdio".into());
+        args.push("--tsProbeLocations".into());
+        args.push(probes.clone());
+        args.push("--ngProbeLocations".into());
+        args.push(probes);
+        args.push("--logToConsole".into());
+        args.push("--logVerbosity".into());
+        args.push("normal".into());
 
         Ok(zed::Command {
             command: zed::node_binary_path()?,
             args,
-            env: Default::default(),
+            env: worktree.shell_env(),
         })
     }
 
@@ -146,7 +160,6 @@ impl zed::Extension for AngularExtension {
         _language_server_id: &zed::LanguageServerId,
         completion: Completion,
     ) -> Option<zed::CodeLabel> {
-        println!("Label for completion {:?}", completion.kind);
         let highlight_name = match completion.kind? {
             CompletionKind::Class | CompletionKind::Interface => "type",
             CompletionKind::Constructor => "constructor",
@@ -163,14 +176,13 @@ impl zed::Extension for AngularExtension {
         let len = completion.label.len();
         let name_span = CodeLabelSpan::literal(completion.label, Some(highlight_name.to_string()));
 
-        let spans = if let Some(detail) = completion.detail {
-            vec![
+        let spans = match completion.detail {
+            Some(detail) => vec![
                 name_span,
                 CodeLabelSpan::literal(" ", None),
-                CodeLabelSpan::literal(detail, Some("detail".to_string())),
-            ]
-        } else {
-            vec![name_span]
+                CodeLabelSpan::literal(detail, Some("comment".to_string())),
+            ],
+            None => vec![name_span],
         };
 
         Some(zed::CodeLabel {

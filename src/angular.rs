@@ -7,6 +7,57 @@ use zed_extension_api::{self as zed, serde_json, Result};
 /// Default location of the language server package, relative to the worktree root.
 const DEFAULT_SERVER_DIR: &str = "node_modules/@angular/language-server";
 
+/// A `node --eval` preamble that loads the language server entry point passed
+/// as `process.argv[1]`.
+///
+/// The preamble leaves `process.argv` identical to a plain `node <entry>`
+/// invocation, so the server parses its own flags unchanged. It has two jobs:
+///
+/// 1. Replace node's bare `MODULE_NOT_FOUND` stack trace with a message that
+///    names the missing package and the command that installs it. The stack
+///    trace mentions neither this extension nor `@angular/language-server`
+///    as something the user must install.
+/// 2. Fall back to node's own resolver, which walks up the directory tree and
+///    therefore finds the package when a workspace hoists it to a parent
+///    `node_modules`. A literal path cannot express that layout.
+///
+/// `__ROOT__` is replaced with a JSON-quoted worktree root by [`loader_script`].
+const LOADER_SCRIPT: &str = r#"
+const requested = process.argv[1];
+const root = __ROOT__;
+let entry;
+try {
+  entry = require.resolve(requested);
+} catch (_) {
+  try {
+    entry = require.resolve("@angular/language-server", { paths: [root] });
+  } catch (_) {
+    console.error([
+      "The Angular extension cannot find the @angular/language-server package.",
+      "",
+      "It looked in these locations:",
+      "  " + requested,
+      "  node module resolution from " + root,
+      "",
+      "The extension does not download a language server. Install the package",
+      "in your project:",
+      "",
+      "  npm install --save-dev @angular/language-server typescript",
+      "",
+      "The major version of @angular/language-server must be equal to the major",
+      "version of Angular in your project.",
+      "",
+      "If the package is in a different location, set the location in your Zed",
+      "settings with this option:",
+      "  lsp.angular.initialization_options.angular_language_server_path",
+    ].join("\n"));
+    process.exit(1);
+  }
+}
+process.argv[1] = entry;
+require(entry);
+"#;
+
 #[derive(Deserialize, Default)]
 struct UserSettings {
     /// Maximum heap size (in MB) for the language server process, passed to
@@ -50,6 +101,17 @@ impl AngularExtension {
             }
             None => path.to_string(),
         }
+    }
+
+    /// Build the `node --eval` preamble with the worktree root inlined.
+    ///
+    /// The root goes through `serde_json` so that separators and quote
+    /// characters in the path stay correct. A JSON string is also a valid
+    /// JavaScript string.
+    fn loader_script(root: &str) -> String {
+        let root_literal =
+            serde_json::to_string(root).unwrap_or_else(|_| String::from("process.cwd()"));
+        LOADER_SCRIPT.replace("__ROOT__", &root_literal)
     }
 
     /// Resolve the language server package directory to an absolute path.
@@ -137,6 +199,12 @@ impl zed::Extension for AngularExtension {
         if let Some(mb) = settings.max_ts_server_memory {
             args.push(format!("--max-old-space-size={mb}"));
         }
+
+        // The preamble runs before the server and keeps `process.argv` intact.
+        // `--` stops node from reading the server flags as its own.
+        args.push("--eval".into());
+        args.push(Self::loader_script(&root));
+        args.push("--".into());
 
         args.push(format!("{server_dir}/index.js"));
         args.push("--stdio".into());

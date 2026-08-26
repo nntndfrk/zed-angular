@@ -22,6 +22,8 @@ npm install --save-dev @angular/language-server typescript
 
 By default the extension looks for the package at `node_modules/@angular/language-server`, relative to the root of the worktree you have open in Zed.
 
+If the package is not at that location, the extension falls back to node's own module resolution from the worktree root. Node walks up the directory tree, so a workspace that hoists the package to a parent `node_modules` works without extra configuration. If both attempts fail, the extension reports the locations it tried and the command that installs the package.
+
 ## Version Management
 
 The extension depends on the `@angular/language-server` and `typescript` Node packages. It will use whatever versions of each that are available locally in your project.

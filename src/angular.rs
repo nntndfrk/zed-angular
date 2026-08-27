@@ -7,6 +7,12 @@ use zed_extension_api::{self as zed, serde_json, Result};
 /// Default location of the language server package, relative to the worktree root.
 const DEFAULT_SERVER_DIR: &str = "node_modules/@angular/language-server";
 
+/// Name of the environment variable that carries the worktree root to the
+/// preamble. Passing the root through the environment instead of inlining it
+/// keeps [`LOADER_SCRIPT`] a compile-time constant: nothing is ever
+/// concatenated into the string that node evaluates.
+const WORKTREE_ROOT_ENV: &str = "ZED_ANGULAR_WORKTREE_ROOT";
+
 /// A `node --eval` preamble that loads the language server entry point passed
 /// as `process.argv[1]`.
 ///
@@ -21,10 +27,13 @@ const DEFAULT_SERVER_DIR: &str = "node_modules/@angular/language-server";
 ///    therefore finds the package when a workspace hoists it to a parent
 ///    `node_modules`. A literal path cannot express that layout.
 ///
-/// `__ROOT__` is replaced with a JSON-quoted worktree root by [`loader_script`].
+/// This string is a constant. It is never templated, formatted, or joined with
+/// a value that comes from the worktree or from user settings. The worktree
+/// root arrives at runtime through [`WORKTREE_ROOT_ENV`], so no path can reach
+/// the evaluated source.
 const LOADER_SCRIPT: &str = r#"
 const requested = process.argv[1];
-const root = __ROOT__;
+const root = process.env.ZED_ANGULAR_WORKTREE_ROOT || process.cwd();
 let entry;
 try {
   entry = require.resolve(requested);
@@ -55,7 +64,10 @@ try {
   }
 }
 process.argv[1] = entry;
-require(entry);
+// Load the entry point as the main module. A plain `require()` under `--eval`
+// leaves `require.main` undefined, so an entry point guarded by
+// `require.main === module` would load and then do nothing.
+require("module")._load(entry, null, true);
 "#;
 
 #[derive(Deserialize, Default)]
@@ -101,17 +113,6 @@ impl AngularExtension {
             }
             None => path.to_string(),
         }
-    }
-
-    /// Build the `node --eval` preamble with the worktree root inlined.
-    ///
-    /// The root goes through `serde_json` so that separators and quote
-    /// characters in the path stay correct. A JSON string is also a valid
-    /// JavaScript string.
-    fn loader_script(root: &str) -> String {
-        let root_literal =
-            serde_json::to_string(root).unwrap_or_else(|_| String::from("process.cwd()"));
-        LOADER_SCRIPT.replace("__ROOT__", &root_literal)
     }
 
     /// Resolve the language server package directory to an absolute path.
@@ -203,7 +204,7 @@ impl zed::Extension for AngularExtension {
         // The preamble runs before the server and keeps `process.argv` intact.
         // `--` stops node from reading the server flags as its own.
         args.push("--eval".into());
-        args.push(Self::loader_script(&root));
+        args.push(LOADER_SCRIPT.into());
         args.push("--".into());
 
         args.push(format!("{server_dir}/index.js"));
@@ -216,10 +217,20 @@ impl zed::Extension for AngularExtension {
         args.push("--logVerbosity".into());
         args.push("normal".into());
 
+        // The preamble reads the root from the environment rather than having it
+        // baked into the evaluated source. Drop any inherited value so the
+        // shell cannot decide where the extension looks for the package.
+        let mut env = worktree.shell_env();
+        env.retain(|(key, _)| key != WORKTREE_ROOT_ENV);
+        env.push((
+            WORKTREE_ROOT_ENV.to_string(),
+            root.trim_end_matches('/').to_string(),
+        ));
+
         Ok(zed::Command {
             command: zed::node_binary_path()?,
             args,
-            env: worktree.shell_env(),
+            env,
         })
     }
 
